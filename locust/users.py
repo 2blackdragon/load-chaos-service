@@ -2,24 +2,13 @@ import random
 import uuid
 import time
 import os
-import threading
 
 from locust import HttpUser, task, between
 
 
-# Configurable knobs (via env vars)
-SEED_ACCOUNT_MIN = int(os.environ.get("LOCUST_SEED_ACCOUNTS", "10"))
-ACCOUNT_REFRESH_TTL = int(os.environ.get("LOCUST_ACCOUNT_REFRESH_TTL", "60"))  # seconds
-# Default creation probabilities lowered to avoid excessive account churn during runs
-NORMAL_CREATE_PROB = float(os.environ.get("LOCUST_CREATE_PROB_NORMAL", "0.01"))
-MIXED_CREATE_PROB = float(os.environ.get("LOCUST_CREATE_PROB_MIXED", "0.005"))
-# Probability that an InvalidUser will actually perform invalid actions (keeps dataset cleaner)
-INVALID_USER_PROB = float(os.environ.get("LOCUST_INVALID_PROB", "0.05"))
-
-# Global cap for creations during a run (0 = unlimited)
-LOCUST_MAX_CREATIONS = int(os.environ.get("LOCUST_MAX_CREATIONS", "200"))
-_created_count = 0
-_created_lock = threading.Lock()
+ACCOUNT_REFRESH_TTL = int(os.environ.get("LOCUST_ACCOUNT_REFRESH_TTL", "60"))
+NORMAL_CREATE_PROB = float(os.environ.get("LOCUST_CREATE_PROB_NORMAL", "0.05"))
+MIXED_CREATE_PROB = float(os.environ.get("LOCUST_CREATE_PROB_MIXED", "0.02"))
 
 
 class BaseBankingUser(HttpUser):
@@ -30,15 +19,6 @@ class BaseBankingUser(HttpUser):
         self.cached_account_ids = []
         self._accounts_loaded_at = 0
         self.load_accounts()
-
-        # Ensure there is a small pool of existing accounts to operate on.
-        if len(self.cached_account_ids) < SEED_ACCOUNT_MIN:
-            self.ensure_seed_accounts(SEED_ACCOUNT_MIN)
-        # debug: report loaded account cache size
-        try:
-            print(f"[locust] on_start loaded {len(self.cached_account_ids)} account ids; sample={self.cached_account_ids[:5]}")
-        except Exception:
-            pass
 
 
     def load_accounts(self, limit: int = 1000):
@@ -64,11 +44,6 @@ class BaseBankingUser(HttpUser):
 
             self.cached_account_ids = ids
             self._accounts_loaded_at = time.time()
-            # debug: report how many ids were loaded
-            try:
-                print(f"[locust] load_accounts fetched {len(self.cached_account_ids)} ids; sample={self.cached_account_ids[:5]}")
-            except Exception:
-                pass
 
         except Exception:
             self.cached_account_ids = []
@@ -76,11 +51,9 @@ class BaseBankingUser(HttpUser):
     def get_random_account(self):
         # refresh cache periodically to avoid stale IDs
         if (not self.cached_account_ids) or (time.time() - getattr(self, "_accounts_loaded_at", 0) > ACCOUNT_REFRESH_TTL):
-            print("[locust] cache empty or stale, reloading accounts")
             self.load_accounts()
 
         if not self.cached_account_ids:
-            print("[locust] no accounts available in cache")
             return None
 
         return random.choice(self.cached_account_ids)
@@ -102,37 +75,6 @@ class BaseBankingUser(HttpUser):
             return None
 
         return response.json()
-
-    def _increment_creation_count(self):
-        global _created_count
-        if LOCUST_MAX_CREATIONS <= 0:
-            return True
-
-        with _created_lock:
-            if _created_count >= LOCUST_MAX_CREATIONS:
-                return False
-            _created_count += 1
-            return True
-
-    def create_user_and_account_limited(self):
-        """Create a user and account atomically and increment global creation counter.
-
-        Returns created account object or None.
-        """
-        # check + create user
-        user = self.create_random_user()
-        if not user:
-            return None
-
-        account = self.create_account(user["id"])
-        if not account:
-            return None
-
-        # only commit creation if under cap (prevents over-creation)
-        if not self._increment_creation_count():
-            return None
-
-        return account
 
     def create_account(self, user_id):
 
@@ -231,7 +173,12 @@ class NormalUser(BaseBankingUser):
         if random.random() > NORMAL_CREATE_PROB:
             return
 
-        account = self.create_user_and_account_limited()
+        user = self.create_random_user()
+
+        if not user:
+            return
+
+        account = self.create_account(user["id"])
 
         if not account:
             return
@@ -330,7 +277,11 @@ class MixedUser(BaseBankingUser):
     @task(1)
     def occasional_create(self):
         if random.random() < MIXED_CREATE_PROB:
-            account = self.create_user_and_account_limited()
+            user = self.create_random_user()
+            if not user:
+                return
+
+            account = self.create_account(user["id"])
             if account:
                 self.cached_account_ids.append(account["id"])
 
@@ -343,9 +294,6 @@ class InvalidUser(BaseBankingUser):
 
     @task(5)
     def invalid_transfer(self):
-        # run invalid actions only occasionally to avoid polluting dataset
-        if random.random() > INVALID_USER_PROB:
-            return
 
         self.client.post(
             "/transfers/",
@@ -359,19 +307,85 @@ class InvalidUser(BaseBankingUser):
 
     @task(3)
     def invalid_account_lookup(self):
-        if random.random() > INVALID_USER_PROB:
-            return
 
         self.client.get("/accounts/99999999")
 
     @task(2)
     def malformed_request(self):
-        if random.random() > INVALID_USER_PROB:
-            return
 
         self.client.post(
             "/transfers/",
             json={
                 "broken": "payload"
             }
+        )
+
+
+class Chaos500User(HttpUser):
+    """
+    Пользователь, который намеренно вызывает серверные ошибки (500)
+    через header-инъекцию.
+    """
+
+    weight = 1
+    wait_time = between(0.1, 0.5)
+
+    def injected_headers(self):
+        return {
+            "X-Inject-Failure": "true"
+        }
+
+    @task(5)
+    def break_accounts_read(self):
+        account_id = random.randint(1, 100000)
+
+        self.client.get(
+            f"/accounts/{account_id}",
+            headers=self.injected_headers()
+        )
+
+    @task(5)
+    def break_accounts_list(self):
+        self.client.get(
+            "/accounts/?limit=50",
+            headers=self.injected_headers()
+        )
+
+    @task(3)
+    def break_transfers(self):
+        self.client.post(
+            "/transfers/",
+            json={
+                "from_account_id": random.randint(1, 1000),
+                "to_account_id": random.randint(1, 1000),
+                "amount": random.randint(1, 10000),
+                "currency": "RUB"
+            },
+            headers=self.injected_headers()
+        )
+
+    @task(2)
+    def break_account_creation(self):
+        username = f"chaos_{uuid.uuid4().hex[:6]}"
+
+        self.client.post(
+            "/users/",
+            json={
+                "username": username,
+                "password": "password123"
+            },
+            headers=self.injected_headers()
+        )
+
+    @task(1)
+    def random_endpoint_stress(self):
+        endpoints = [
+            "/accounts/",
+            "/accounts/?limit=10",
+            "/transfers/",
+        ]
+
+        self.client.get(
+            random.choice(endpoints),
+            headers=self.injected_headers()
         )
