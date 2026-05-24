@@ -1,15 +1,14 @@
-version: "3.9"
-
 services:
   locust:
-    build: .
+    build:
+      context: .
+    image: load-chaos-service-locust:latest
     ports:
       - "8089:8089"
     environment:
       LOCUST_SCENARIO: dataset_day
-      LOCUST_ACCOUNT_REFRESH_TTL: 60
-      LOCUST_CREATE_PROB_NORMAL: 0.05
-      LOCUST_CREATE_PROB_MIXED: 0.02
     command: >
-      locust -f locustfile.py
+      locust -f locust/locustfile.py
       --host=http://138.16.162.15:8000
+      --headless
+      --run-time 20m
