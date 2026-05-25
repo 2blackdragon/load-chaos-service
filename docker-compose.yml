@@ -7,8 +7,12 @@ services:
       - "8089:8089"
     environment:
       LOCUST_SCENARIO: dataset_day
+      LOCUST_DATASET_INTERVAL: 15.0
+      LOCUST_CSV_DIR: /data
+      LOCUST_CSV_NAME: metrics_15s.csv
+    volumes:
+      - /data
     command: >
       locust -f locust/locustfile.py
       --host=http://138.16.162.15:8000
       --headless
-      --run-time 20m

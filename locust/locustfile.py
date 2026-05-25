@@ -1,41 +1,51 @@
 from __future__ import annotations
 
-import math
 import os
 import random
 import time
+import csv
+from pathlib import Path
 
 from locust import events, LoadTestShape
 
-from scenarios import MINI_PATTERNS, SCENARIOS, MiniPattern, build_stages
+from scenarios import (
+    build_fourteen_day_plan,
+    DayRun,
+    WeeklyEnvelope,
+    ANOMALY_INJECTOR,
+    ERROR_MODEL,
+    compute_latency,
+    MetricsTick,
+    MINI_PATTERNS,
+)
+
 from users import AggressiveUser, Chaos500User, InvalidUser, MixedUser, NormalUser
 
 # ---------------------------------------------------------------------------
-# Конфиг из env
+# Config
 # ---------------------------------------------------------------------------
 
-SCENARIO_NAME = os.getenv("LOCUST_SCENARIO", "quick_trial")
-
-# build_stages() раскрывает сценарий: применяет skip_probability и фиксирует
-# случайную duration для каждого стейджа на весь прогон.
-SCENARIO = build_stages(SCENARIO_NAME)
-
-# Шум на каждом тике ±N% от текущего таргета (поверх шума мини-паттерна)
+SCENARIO_NAME = os.getenv("LOCUST_SCENARIO", "dataset_day")
+START_WEEKDAY = int(os.getenv("LOCUST_START_WEEKDAY", "0"))
 GLOBAL_NOISE = float(os.getenv("LOCUST_NOISE", "0.06"))
-
 ALL_USER_CLASSES = [NormalUser, AggressiveUser, MixedUser, InvalidUser, Chaos500User]
+
+# CSV output config
+CSV_OUTPUT_DIR = Path(os.getenv("LOCUST_CSV_DIR", "."))
+CSV_FILENAME = os.getenv("LOCUST_CSV_NAME", "locust_metrics.csv")
+
+# Dataset tick interval (seconds)
+DATASET_TICK_INTERVAL = float(os.getenv("LOCUST_DATASET_INTERVAL", "15.0"))
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
 
 def _lerp(a: float, b: float, t: float) -> float:
     return a + (b - a) * max(0.0, min(1.0, t))
 
 
 def _smooth(t: float) -> float:
-    """Smoothstep — плавнее чем линейная, без рывков на концах."""
     return t * t * (3 - 2 * t)
 
 
@@ -50,217 +60,246 @@ def _set_weights(weights: dict[str, int]) -> None:
         cls.weight = weights.get(name, 0)
 
 
-def _resolve_duration(stage: dict) -> int:
-    """Вернуть зафиксированную длительность стейджа.
+# ---------------------------------------------------------------------------
+# CSV Writer
+# ---------------------------------------------------------------------------
 
-    При первом вызове выбирает случайное значение из диапазона
-    duration_min/duration_max и кеширует его в ключе _duration_resolved,
-    чтобы длительность не менялась между тиками.
-    Поддерживает старый формат с ключом duration (число).
-    """
-    if "_duration_resolved" not in stage:
-        if "duration" in stage:
-            stage["_duration_resolved"] = int(stage["duration"])
-        else:
-            lo = int(stage["duration_min"])
-            hi = int(stage["duration_max"])
-            stage["_duration_resolved"] = random.randint(lo, hi)
-    return stage["_duration_resolved"]
+class MetricsCSVWriter:
+    """Потоковая запись метрик в CSV без накопления в памяти."""
+
+    def __init__(self, filepath: Path):
+        self.filepath = filepath
+        self._file = None
+        self._writer = None
+        self._header_written = False
+
+    def _ensure_open(self):
+        if self._file is None:
+            self._file = open(self.filepath, "w", newline="", encoding="utf-8")
+            self._writer = csv.DictWriter(
+                self._file,
+                fieldnames=list(MetricsTick.__dataclass_fields__.keys()),
+            )
+
+    def write(self, tick: MetricsTick):
+        self._ensure_open()
+        if not self._header_written:
+            self._writer.writeheader()
+            self._header_written = True
+        self._writer.writerow(tick.as_dict())
+        self._file.flush()
+
+    def close(self):
+        if self._file:
+            self._file.close()
+            self._file = None
 
 
 # ---------------------------------------------------------------------------
-# Состояние мини-паттернов
+# 14-day auto runner
 # ---------------------------------------------------------------------------
-
-
-class MiniPatternState:
-    """
-    Выбирает мини-паттерны из пула стейджа взвешенным случайным выбором.
-
-    Пул задаётся как список пар (имя, вес) или просто имён (тогда вес=1).
-    Следующий паттерн выбирается через random.choices — чем выше вес,
-    тем чаще паттерн встречается. Повторы подряд исключены: если выпал
-    тот же паттерн что и текущий, делается ещё одна попытка (до 3 раз).
-
-    Длительность паттерна фиксируется один раз при старте (_resolved_duration),
-    чтобы повторные обращения к MiniPattern.duration не давали разные значения.
-    """
-
-    def __init__(self, pattern_spec: list):
-        self._names: list[str] = []
-        self._weights: list[float] = []
-        self._current: MiniPattern | None = None
-        self._started_at: float = 0.0
-        self._resolved_duration: int = 0
-        self.reset(pattern_spec)
-
-    def reset(self, pattern_spec: list) -> None:
-        """pattern_spec: list of str или list of (str, float)."""
-        self._names = []
-        self._weights = []
-        for entry in pattern_spec:
-            if isinstance(entry, (list, tuple)):
-                name, w = entry[0], float(entry[1])
-            else:
-                name, w = entry, 1.0
-            if name in MINI_PATTERNS:
-                self._names.append(name)
-                self._weights.append(w)
-        self._current = None
-        self._started_at = 0.0
-        self._resolved_duration = 0
-
-    def tick(self, now: float) -> MiniPattern | None:
-        if not self._names:
-            return None
-
-        if self._current is None:
-            self._start_next(now)
-
-        elapsed = now - self._started_at
-        if elapsed >= self._resolved_duration:
-            self._start_next(now)
-
-        return self._current
-
-    def progress(self, now: float) -> float:
-        if self._current is None or self._resolved_duration == 0:
-            return 0.0
-        elapsed = now - self._started_at
-        return min(1.0, elapsed / self._resolved_duration)
-
-    def _pick_name(self) -> str:
-        """Взвешенный выбор без повтора текущего паттерна (до 3 попыток)."""
-        current_name = self._current.name if self._current else None
-        for _ in range(3):
-            name = random.choices(self._names, weights=self._weights, k=1)[0]
-            if name != current_name or len(self._names) == 1:
-                return name
-        return name  # после 3 попыток берём что есть
-
-    def _start_next(self, now: float) -> None:
-        name = self._pick_name()
-        self._current = MINI_PATTERNS[name]
-        self._started_at = now
-        # Фиксируем длительность один раз — вызываем property ровно здесь
-        self._resolved_duration = self._current.duration
-        print(f"[MINI] → {self._current.name} ({self._resolved_duration}s, w={self._weights[self._names.index(name)]:.0f})")
-
-
-# ---------------------------------------------------------------------------
-# ScenarioShape
-# ---------------------------------------------------------------------------
-
 
 class ScenarioShape(LoadTestShape):
-    """
-    Управляет нагрузкой по стейджам из scenarios.py.
-
-    Каждый тик:
-    1. Определяет текущий стейдж и прогресс внутри него.
-    2. Если идёт transition-период — плавная интерполяция через smoothstep.
-    3. Если в стейдже есть mini_patterns — накладывает паттерн через sin-горб.
-    4. Добавляет глобальный шум ±LOCUST_NOISE.
-    5. Возвращает (users, spawn_rate).
-    """
+    """Auto 14-day execution inside Locust (no bash loop needed)."""
 
     def __init__(self):
         super().__init__()
-        self._mini = MiniPatternState([])
-        self._prev_stage_idx: int = -1
-        self._weights_stage_idx: int = -1
 
-    def tick(self) -> tuple[int, float] | None:
+        self.plan: list[DayRun] = build_fourteen_day_plan(
+            start_weekday=START_WEEKDAY,
+            scenario_name=SCENARIO_NAME,
+        )
+
+        # precompute day offsets
+        self._day_offsets = []
+        total = 0
+        for day in self.plan:
+            day_duration = 0
+            for s in day.stages:
+                day_duration += (s.get("_duration_resolved") or 0)
+            self._day_offsets.append(total)
+            total += day_duration
+
+        self._total_duration = total
+        self._weights_stage_idx = -1
+
+        # CSV writer
+        csv_path = CSV_OUTPUT_DIR / CSV_FILENAME
+        CSV_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        self.csv_writer = MetricsCSVWriter(csv_path)
+        print(f"[CSV] Writing metrics to: {csv_path.absolute()}")
+        print(f"[CSV] Dataset tick interval: {DATASET_TICK_INTERVAL}s")
+
+        # track mini-pattern state
+        self._current_mini_pattern: str = ""
+        self._mini_pattern_end_time: float = 0.0
+
+        # ⬇️ Таймер для записи в CSV каждые N секунд
+        self._last_dataset_tick: float = 0.0
+
+    def _pick_mini_pattern(self, stage: dict, stage_start: float) -> str:
+        """Выбрать мини-паттерн из стейджа по весам."""
+        patterns = stage.get("mini_patterns", [])
+        if not patterns:
+            return ""
+
+        names = [p[0] for p in patterns]
+        weights = [p[1] for p in patterns]
+        total = sum(weights)
+        r = random.uniform(0, total)
+        cumulative = 0
+        for name, w in zip(names, weights):
+            cumulative += w
+            if r <= cumulative:
+                return name
+        return names[-1]
+
+    def tick(self):
         run_time = self.get_run_time()
-        now = time.time()
 
-        # --- Найти текущий стейдж ---
+        # stop after 14 days
+        if run_time > self._total_duration:
+            self.csv_writer.close()
+            return None
+
+        # find day
+        day_idx = 0
+        for i in range(len(self._day_offsets)):
+            if i == len(self._day_offsets) - 1 or run_time < self._day_offsets[i + 1]:
+                day_idx = i
+                break
+
+        day = self.plan[day_idx]
+        envelope = day.envelope
+
+        # local time inside day
+        day_start = self._day_offsets[day_idx]
+        t_in_day = run_time - day_start
+
+        # find stage
         elapsed = 0.0
-        stage_idx = None
+        stage_idx = 0
         stage_start = 0.0
 
-        for i, stage in enumerate(SCENARIO):
-            duration = _resolve_duration(stage)
-            stage_end = elapsed + duration
-            if run_time < stage_end:
+        for i, stage in enumerate(day.stages):
+            duration = stage.get("_duration_resolved", 0)
+            if t_in_day < elapsed + duration:
                 stage_idx = i
                 stage_start = elapsed
                 break
-            elapsed = stage_end
+            elapsed += duration
 
-        if stage_idx is None:
-            return None  # сценарий завершён
-
-        stage = SCENARIO[stage_idx]
-        stage_elapsed = run_time - stage_start
+        stage = day.stages[stage_idx]
+        stage_elapsed = t_in_day - stage_start
         transition = stage.get("transition", 60)
 
-        # --- Обновить веса при смене стейджа ---
+        # weights
         if stage_idx != self._weights_stage_idx:
             _set_weights(stage.get("weights", {}))
             self._weights_stage_idx = stage_idx
-            duration = _resolve_duration(stage)
-            print(f"[STAGE] → {stage.get('name', stage_idx)}  duration={duration}s  weights={stage.get('weights')}")
+            print(f"[DAY {day.day_index}] STAGE {stage.get('name')}")
 
-        # --- Обновить пул мини-паттернов при смене стейджа ---
-        if stage_idx != self._prev_stage_idx:
-            self._mini.reset(stage.get("mini_patterns", []))
-            self._prev_stage_idx = stage_idx
+        u_min, u_max = stage["users_min"], stage["users_max"]
+        s_min, s_max = stage["spawn_min"], stage["spawn_max"]
 
-        # --- Базовый диапазон текущего стейджа ---
-        u_min = stage["users_min"]
-        u_max = stage["users_max"]
-        s_min = stage["spawn_min"]
-        s_max = stage["spawn_max"]
-
-        # --- Transition: плавный вход из предыдущего стейджа ---
+        # transition smoothing
         if stage_elapsed < transition and stage_idx > 0:
-            prev = SCENARIO[stage_idx - 1]
+            prev = day.stages[stage_idx - 1]
             t = _smooth(stage_elapsed / transition)
+
             prev_u = (prev["users_min"] + prev["users_max"]) / 2
             curr_u = (u_min + u_max) / 2
+
             prev_s = (prev["spawn_min"] + prev["spawn_max"]) / 2
             curr_s = (s_min + s_max) / 2
+
             base_users = _lerp(prev_u, curr_u, t)
             base_spawn = _lerp(prev_s, curr_s, t)
         else:
             base_users = random.uniform(u_min, u_max)
             base_spawn = random.uniform(s_min, s_max)
 
-        # --- Мини-паттерн (sin-горб поверх базы) ---
-        mini = self._mini.tick(now)
-        if mini is not None:
-            progress = self._mini.progress(now)
-            sin_t = math.sin(math.pi * progress)  # 0 → 1 → 0
+        # envelope (14-day)
+        scale = envelope.scale_factor
+        base_users *= scale
+        base_spawn *= scale
 
-            mini_u = _lerp(mini.users_min, mini.users_max, sin_t)
-            mini_s = _lerp(mini.spawn_min, mini.spawn_max, sin_t)
+        # anomaly
+        anomaly = ANOMALY_INJECTOR.tick(base_users, stage)
+        base_users *= anomaly.users_multiplier
+        base_spawn *= anomaly.latency_multiplier
 
-            # blend=0.4: паттерн влияет на 40% итогового значения
-            blend = 0.4
-            base_users = _lerp(base_users, mini_u, blend)
-            base_spawn = _lerp(base_spawn, mini_s, blend)
-
-            base_users = _apply_noise(base_users, mini.noise)
-            base_spawn = _apply_noise(base_spawn, mini.noise)
-
-        # --- Глобальный шум ---
+        # noise
         base_users = _apply_noise(base_users, GLOBAL_NOISE)
         base_spawn = _apply_noise(base_spawn, GLOBAL_NOISE * 0.5)
 
         users = max(1, int(round(base_users)))
         spawn_rate = max(0.5, round(base_spawn, 2))
 
+        # mini-pattern logic
+        stage_abs_start = day_start + stage_start
+        if run_time >= self._mini_pattern_end_time:
+            self._current_mini_pattern = self._pick_mini_pattern(stage, stage_abs_start)
+            if self._current_mini_pattern in MINI_PATTERNS:
+                mp = MINI_PATTERNS[self._current_mini_pattern]
+                self._mini_pattern_end_time = run_time + mp.duration
+            else:
+                self._mini_pattern_end_time = run_time + 60
+
+        # compute error_rate and latency
+        error_rate = ERROR_MODEL.compute(
+            users=users,
+            mini_pattern_name=self._current_mini_pattern or None,
+            anomaly_multiplier=anomaly.error_multiplier,
+        )
+        latency_ms = compute_latency(
+            users=users,
+            mini_pattern_name=self._current_mini_pattern or None,
+            anomaly=anomaly,
+        )
+
+        # ⬇️ ЗАПИСЬ В CSV ТОЛЬКО КАЖДЫЕ 15 СЕКУНД
+        should_write_csv = (run_time - self._last_dataset_tick) >= DATASET_TICK_INTERVAL
+
+        if should_write_csv:
+            self._last_dataset_tick = run_time
+
+            tick_data = MetricsTick(
+                timestamp=time.time(),
+                day_index=day.day_index,
+                weekday=day.weekday,
+                hour=(t_in_day % 86400) / 3600,
+                stage_name=stage.get("name", ""),
+                mini_pattern=self._current_mini_pattern,
+                users=users,
+                spawn_rate=spawn_rate,
+                scale_factor=envelope.scale_factor,
+                error_rate=error_rate,
+                latency_ms=latency_ms,
+                is_weekend=envelope.is_weekend,
+                is_anomaly=anomaly.is_anomaly,
+                anomaly_type=anomaly.label,
+                severity=anomaly.severity.value,
+            )
+            self.csv_writer.write(tick_data)
+
+            print(
+                f"[DATASET] day={day.day_index} stage={stage.get('name')} "
+                f"users={users} spawn={spawn_rate} err={error_rate:.4f} "
+                f"lat={latency_ms:.1f}ms anomaly={anomaly.label}"
+            )
+
+        # Возвращаем управление Locust каждый тик (нагрузка работает непрерывно)
+        print(f"[TICK] users={users}, spawn_rate={spawn_rate}")
         return users, spawn_rate
-
-
-# ---------------------------------------------------------------------------
-# Event hooks
-# ---------------------------------------------------------------------------
 
 
 @events.test_start.add_listener
 def on_test_start(environment, **kwargs):
-    print(f"[SCENARIO] Starting '{SCENARIO_NAME}' ({len(SCENARIO)} stages)")
-    if SCENARIO:
-        _set_weights(SCENARIO[0].get("weights", {}))
+    print("[SCENARIO] 14-day auto-run enabled")
+    print(f"[SCENARIO] CSV output: {CSV_OUTPUT_DIR / CSV_FILENAME}")
+
+
+@events.test_stop.add_listener
+def on_test_stop(environment, **kwargs):
+    print("[SCENARIO] Test finished, CSV closed")
