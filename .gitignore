@@ -1,6 +1,4 @@
 .DS_Store
 .idea/
 .venv/
-cpu_dataset.csv
-memory_dataset.csv
-metrics.csv
+data/

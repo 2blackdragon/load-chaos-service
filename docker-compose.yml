@@ -11,7 +11,7 @@ services:
       LOCUST_CSV_DIR: /data
       LOCUST_CSV_NAME: metrics_15s.csv
     volumes:
-      - /data
+      - ./data:/data
     command: >
       locust -f locust/locustfile.py
       --host=http://138.16.162.15:8000

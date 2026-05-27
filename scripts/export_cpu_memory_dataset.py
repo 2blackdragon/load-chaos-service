@@ -3,8 +3,8 @@ import csv
 
 PROMETHEUS_URL = "http://138.16.162.15:9090"
 
-START = "2026-05-24T23:00:00Z"
-END = "2026-05-25T18:00:00Z"
+START = "2026-05-25T18:42:00Z"  # МСК 21:42
+END = "2026-05-26T10:00:00Z"  # МСК 13:00
 STEP = "15s"
 
 CPU_QUERY = """
@@ -53,10 +53,10 @@ def save_csv(filename, results, value_name):
 
 # CPU
 cpu_results = fetch(CPU_QUERY)
-save_csv("cpu_dataset.csv", cpu_results, "cpu_usage_percent")
+save_csv("../data/cpu_dataset.csv", cpu_results, "cpu_usage_percent")
 
 # Memory
 mem_results = fetch(MEM_QUERY)
-save_csv("memory_dataset.csv", mem_results, "memory_usage_percent")
+save_csv("../data/memory_dataset.csv", mem_results, "memory_usage_percent")
 
 print("Done")
