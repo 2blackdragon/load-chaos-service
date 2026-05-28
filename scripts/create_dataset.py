@@ -1,39 +1,29 @@
 import pandas as pd
-import os
-import glob
 
+# Загружаем датасеты
+df1 = pd.read_csv("../data/metrics_15s.csv")
+df2 = pd.read_csv("../data/cpu_dataset.csv")
 
-# Получаем список всех CSV файлов
-all_files = glob.glob(os.path.join('data/', '*.csv'))
-all_files = [f for f in all_files if 'metrics_15s' not in os.path.basename(f)]
+# Удаляем timestamp из первого датасета
+if "timestamp" in df1.columns:
+    df1 = df1.drop(columns=["timestamp"])
 
-print(f"Найдено файлов: {len(all_files)}")
-for f in all_files:
-    print(f"  - {os.path.basename(f)}")
+# Берем из первого датасета столько строк,
+# сколько есть во втором
+df1_slice = df1.iloc[15: 15 + len(df2)]
 
-# ===== 2. ЗАГРУЖАЕМ И СКЛЕИВАЕМ ВСЕ ФАЙЛЫ =====
-merged_df = None
+# Склеиваем ПО КОЛОНКАМ
+merged_df = pd.concat(
+    [
+        df2.reset_index(drop=True),
+        df1_slice.reset_index(drop=True)
+    ],
+    axis=1
+)
 
-for file_path in all_files:
-    df = pd.read_csv(file_path)
-    
-    # Объединяем
-    if merged_df is None:
-        merged_df = df
-    else:
-        merged_df = pd.merge(merged_df, df, on='timestamp', how='outer')
+# Сохраняем
+merged_df.to_csv("merged_dataset.csv", index=False)
 
-
-
-if merged_df is not None:
-    merged_df['timestamp'] = pd.to_datetime(merged_df['timestamp'])
-    merged_df = merged_df.sort_values('timestamp').reset_index(drop=True)
-    
-    merged_df.to_csv('merged_all_files.csv', index=False)
-    
-    print(f"\nРезультат: {merged_df.shape[0]} строк, {merged_df.shape[1]} колонок")
-    print(f"Колонки: {list(merged_df.columns)}")
-    print(f"\nПервые 5 строк:")
-    print(merged_df.head())
-else:
-    print("Файлы не найдены!")
+print("Размер первого среза:", df1_slice.shape)
+print("Размер второго датасета:", df2.shape)
+print("Размер итогового датасета:", merged_df.shape)
