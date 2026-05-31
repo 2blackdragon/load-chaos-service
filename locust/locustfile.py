@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import random
 import time
-import csv
 from pathlib import Path
 
 from locust import events, LoadTestShape
@@ -15,7 +14,6 @@ from scenarios import (
     ANOMALY_INJECTOR,
     ERROR_MODEL,
     compute_latency,
-    MetricsTick,
     MINI_PATTERNS,
 )
 
@@ -30,12 +28,6 @@ START_WEEKDAY = int(os.getenv("LOCUST_START_WEEKDAY", "0"))
 GLOBAL_NOISE = float(os.getenv("LOCUST_NOISE", "0.06"))
 ALL_USER_CLASSES = [NormalUser, AggressiveUser, MixedUser, InvalidUser, Chaos500User]
 
-# CSV output config
-CSV_OUTPUT_DIR = Path(os.getenv("LOCUST_CSV_DIR", "."))
-CSV_FILENAME = os.getenv("LOCUST_CSV_NAME", "locust_metrics.csv")
-
-# Dataset tick interval (seconds)
-DATASET_TICK_INTERVAL = float(os.getenv("LOCUST_DATASET_INTERVAL", "15.0"))
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -58,41 +50,6 @@ def _set_weights(weights: dict[str, int]) -> None:
     mapping = {cls.__name__: cls for cls in ALL_USER_CLASSES}
     for name, cls in mapping.items():
         cls.weight = weights.get(name, 0)
-
-
-# ---------------------------------------------------------------------------
-# CSV Writer
-# ---------------------------------------------------------------------------
-
-class MetricsCSVWriter:
-    """Потоковая запись метрик в CSV без накопления в памяти."""
-
-    def __init__(self, filepath: Path):
-        self.filepath = filepath
-        self._file = None
-        self._writer = None
-        self._header_written = False
-
-    def _ensure_open(self):
-        if self._file is None:
-            self._file = open(self.filepath, "w", newline="", encoding="utf-8")
-            self._writer = csv.DictWriter(
-                self._file,
-                fieldnames=list(MetricsTick.__dataclass_fields__.keys()),
-            )
-
-    def write(self, tick: MetricsTick):
-        self._ensure_open()
-        if not self._header_written:
-            self._writer.writeheader()
-            self._header_written = True
-        self._writer.writerow(tick.as_dict())
-        self._file.flush()
-
-    def close(self):
-        if self._file:
-            self._file.close()
-            self._file = None
 
 
 # ---------------------------------------------------------------------------
@@ -123,19 +80,9 @@ class ScenarioShape(LoadTestShape):
         self._total_duration = total
         self._weights_stage_idx = -1
 
-        # CSV writer
-        csv_path = CSV_OUTPUT_DIR / CSV_FILENAME
-        CSV_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        self.csv_writer = MetricsCSVWriter(csv_path)
-        print(f"[CSV] Writing metrics to: {csv_path.absolute()}")
-        print(f"[CSV] Dataset tick interval: {DATASET_TICK_INTERVAL}s")
-
         # track mini-pattern state
         self._current_mini_pattern: str = ""
         self._mini_pattern_end_time: float = 0.0
-
-        # ⬇️ Таймер для записи в CSV каждые N секунд
-        self._last_dataset_tick: float = 0.0
 
     def _pick_mini_pattern(self, stage: dict, stage_start: float) -> str:
         """Выбрать мини-паттерн из стейджа по весам."""
@@ -159,7 +106,6 @@ class ScenarioShape(LoadTestShape):
 
         # stop after 14 days
         if run_time > self._total_duration:
-            self.csv_writer.close()
             return None
 
         # find day
@@ -246,49 +192,6 @@ class ScenarioShape(LoadTestShape):
             else:
                 self._mini_pattern_end_time = run_time + 60
 
-        # compute error_rate and latency
-        error_rate = ERROR_MODEL.compute(
-            users=users,
-            mini_pattern_name=self._current_mini_pattern or None,
-            anomaly_multiplier=anomaly.error_multiplier,
-        )
-        latency_ms = compute_latency(
-            users=users,
-            mini_pattern_name=self._current_mini_pattern or None,
-            anomaly=anomaly,
-        )
-
-        # ⬇️ ЗАПИСЬ В CSV ТОЛЬКО КАЖДЫЕ 15 СЕКУНД
-        should_write_csv = (run_time - self._last_dataset_tick) >= DATASET_TICK_INTERVAL
-
-        if should_write_csv:
-            self._last_dataset_tick = run_time
-
-            tick_data = MetricsTick(
-                timestamp=time.time(),
-                day_index=day.day_index,
-                weekday=day.weekday,
-                hour=(t_in_day % 86400) / 3600,
-                stage_name=stage.get("name", ""),
-                mini_pattern=self._current_mini_pattern,
-                users=users,
-                spawn_rate=spawn_rate,
-                scale_factor=envelope.scale_factor,
-                error_rate=error_rate,
-                latency_ms=latency_ms,
-                is_weekend=envelope.is_weekend,
-                is_anomaly=anomaly.is_anomaly,
-                anomaly_type=anomaly.label,
-                severity=anomaly.severity.value,
-            )
-            self.csv_writer.write(tick_data)
-
-            print(
-                f"[DATASET] day={day.day_index} stage={stage.get('name')} "
-                f"users={users} spawn={spawn_rate} err={error_rate:.4f} "
-                f"lat={latency_ms:.1f}ms anomaly={anomaly.label}"
-            )
-
         # Возвращаем управление Locust каждый тик (нагрузка работает непрерывно)
         print(f"[TICK] users={users}, spawn_rate={spawn_rate}")
         return users, spawn_rate
@@ -297,9 +200,8 @@ class ScenarioShape(LoadTestShape):
 @events.test_start.add_listener
 def on_test_start(environment, **kwargs):
     print("[SCENARIO] 14-day auto-run enabled")
-    print(f"[SCENARIO] CSV output: {CSV_OUTPUT_DIR / CSV_FILENAME}")
 
 
 @events.test_stop.add_listener
 def on_test_stop(environment, **kwargs):
-    print("[SCENARIO] Test finished, CSV closed")
+    print("[SCENARIO] Test finished")
